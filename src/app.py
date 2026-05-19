@@ -1,16 +1,11 @@
 import os
-import base64
 import io
+import time
+import base64
 import logging
-from typing import Annotated
-
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+import tempfile
+from flask import Flask, render_template, request, jsonify
 from PIL import Image, ImageFile, UnidentifiedImageError
-from pydantic import BaseModel
-
 from src.model import VQAEngine
 
 # Configuration
@@ -29,14 +24,15 @@ logger = logging.getLogger("multimodal_ai")
 Image.MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(20_000_000)))
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 
-app = FastAPI(title="Multimodal AI VQA")
-
-# Mount static files and templates
-app.mount("/static", StaticFiles(directory="src/static"), name="static")
-templates = Jinja2Templates(directory="src/templates")
+app = Flask(__name__)
+# Limit standard request body size (Flask will return 413 if exceeded)
+app.config["MAX_CONTENT_LENGTH"] = (
+    30 * 1024 * 1024
+)  # Max 30MB total to allow 25MB video uploads
 
 # Lazy initialization of VQA engine
 _engine: VQAEngine | None = None
+
 
 def get_engine() -> VQAEngine:
     global _engine
@@ -46,91 +42,187 @@ def get_engine() -> VQAEngine:
         logger.info("VQA Engine ready.")
     return _engine
 
-def validate_and_process_image(file: UploadFile) -> str:
+
+def validate_and_process_image(file) -> str:
     """
     Validates image mime-type, size, and resizes if it exceeds MAX_IMAGE_DIMENSION.
     Returns base64 encoded JPEG string.
     """
     # 1. MIME Type Check
-    if file.content_type not in ALLOWED_IMAGE_MIMES:
-        raise HTTPException(status_code=415, detail=f"Unsupported image type: {file.content_type}")
+    if file.mimetype not in ALLOWED_IMAGE_MIMES:
+        raise ValueError(f"Unsupported image type: {file.mimetype}")
 
-    try:
-        # 2. Read bytes and check size
-        image_bytes = file.file.read()
-        if len(image_bytes) > MAX_CONTENT_LENGTH:
-            raise HTTPException(status_code=413, detail="Image too large")
+    # 2. Read bytes and check size
+    image_bytes = file.read()
+    if len(image_bytes) > MAX_CONTENT_LENGTH:
+        raise ValueError("Image file too large (Max 10MB)")
 
-        # 3. Open and verify
-        image = Image.open(io.BytesIO(image_bytes))
-        image.verify()
+    # 3. Open and verify
+    image = Image.open(io.BytesIO(image_bytes))
+    image.verify()
 
-        # Re-open after verify() because it closes the file
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    # Re-open after verify() because it closes the file
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-        # 4. Resolution Capping (Resizing)
-        # Resize if the longest side exceeds MAX_IMAGE_DIMENSION
-        width, height = image.size
-        if max(width, height) > MAX_IMAGE_DIMENSION:
-            logger.info(f"Resizing image from {width}x{height} to fit within {MAX_IMAGE_DIMENSION}px")
-            if width > height:
-                new_width = MAX_IMAGE_DIMENSION
-                new_height = int(height * (MAX_IMAGE_DIMENSION / width))
-            else:
-                new_height = MAX_IMAGE_DIMENSION
-                new_width = int(width * (MAX_IMAGE_DIMENSION / height))
+    # 4. Resolution Capping (Resizing)
+    width, height = image.size
+    if max(width, height) > MAX_IMAGE_DIMENSION:
+        logger.info(
+            f"Resizing image from {width}x{height} to fit within {MAX_IMAGE_DIMENSION}px"
+        )
+        if width > height:
+            new_width = MAX_IMAGE_DIMENSION
+            new_height = int(height * (MAX_IMAGE_DIMENSION / width))
+        else:
+            new_height = MAX_IMAGE_DIMENSION
+            new_width = int(width * (MAX_IMAGE_DIMENSION / height))
 
-            image = image.resize((new_width, new_height), Image.LANCZOS)
+        image = image.resize((new_width, new_height), Image.LANCZOS)
 
-        # 5. Convert to Base64 JPEG
-        buffered = io.BytesIO()
-        image.save(buffered, format="JPEG", quality=85)
-        return base64.b64encode(buffered.getvalue()).decode("utf-8")
+    # 5. Convert to Base64 JPEG
+    buffered = io.BytesIO()
+    image.save(buffered, format="JPEG", quality=85)
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-    except UnidentifiedImageError:
-        raise HTTPException(status_code=400, detail="Invalid or corrupted image")
-    except Image.DecompressionBombError:
-        raise HTTPException(status_code=413, detail="Image too large (decompression bomb)")
-    except Exception as e:
-        logger.exception("Image processing error")
-        raise HTTPException(status_code=500, detail="Internal server error processing image")
 
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+@app.route("/")
+def index():
+    return render_template("index.html")
 
-@app.post("/predict")
-async def predict(
-    request: Request,
-    image: UploadFile = File(...),
-    question: str = Form(...)
-):
+
+@app.route("/predict", methods=["POST"])
+def predict():
     """
-    Predicts answer for a given image and question.
+    Unified endpoint to handle Image VQA, Video VQA (local upload), or YouTube VQA queries.
     """
-    try:
-        # Validate and process image
-        img_b64 = validate_and_process_image(image)
+    start_time = time.time()
+    question = request.form.get("question", "").strip()
 
-        # Engine prediction (called as a blocking op in a threadpool by FastAPI if not async)
-        # Since VQAEngine.predict is synchronous, we'll use a threadpool (implicit in FastAPI
-        # when using 'def' vs 'async def', but since this is 'async def', we should
-        # wrap the synchronous call in run_in_threadpool or just use 'def predict')
-        # However, to keep it truly async, we'll use a threadpool.
+    if not question:
+        return jsonify({"error": "Please ask a question."}), 400
 
-        from fastapi.concurrency import run_in_threadpool
-        answer = await run_in_threadpool(get_engine().predict, img_b64, question)
+    # 1. Case A: YouTube URL is provided
+    youtube_url = request.form.get("youtube_url", "").strip()
+    if youtube_url:
+        try:
+            answer = get_engine().predict_youtube(youtube_url, question)
+            elapsed_time = round(time.time() - start_time, 2)
+            return jsonify(
+                {
+                    "answer": answer,
+                    "metrics": {
+                        "model": os.getenv("MODEL_NAME", "gemini-2.5-flash"),
+                        "time": f"{elapsed_time}s",
+                        "type": "YouTube Video",
+                    },
+                }
+            )
+        except Exception as e:
+            logger.exception("YouTube VQA controller error")
+            return jsonify({"error": str(e)}), 500
 
-        return {"answer": answer}
+    # 2. Case B: Video file is uploaded
+    if "video" in request.files and request.files["video"].filename != "":
+        video_file = request.files["video"]
+        # Max video size: 25MB
+        MAX_VIDEO_SIZE = 25 * 1024 * 1024
 
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logger.exception("Predict error")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        # Read video bytes to check size
+        video_bytes = video_file.read()
+        if len(video_bytes) > MAX_VIDEO_SIZE:
+            return jsonify({"error": "Video file too large (Max 25MB)"}), 413
+
+        # Reset file pointer
+        video_file.seek(0)
+
+        # Check MIME type and file extension
+        ALLOWED_VIDEO_MIMES = {
+            "video/mp4",
+            "video/webm",
+            "video/quicktime",
+            "video/mov",
+        }
+        content_type = video_file.content_type
+        is_valid_ext = video_file.filename.lower().endswith(
+            (".mp4", ".webm", ".mov", ".avi")
+        )
+
+        if content_type not in ALLOWED_VIDEO_MIMES and not is_valid_ext:
+            return jsonify(
+                {"error": f"Unsupported video type: {content_type or 'unknown'}"}
+            ), 415
+
+        # Create temporary file to store video
+        temp_dir = tempfile.gettempdir()
+        suffix = os.path.splitext(video_file.filename)[1]
+        temp_file_handle, temp_file_path = tempfile.mkstemp(suffix=suffix, dir=temp_dir)
+
+        try:
+            with os.fdopen(temp_file_handle, "wb") as temp_file:
+                temp_file.write(video_bytes)
+
+            # Predict from video
+            answer = get_engine().predict_video(temp_file_path, question)
+            elapsed_time = round(time.time() - start_time, 2)
+            return jsonify(
+                {
+                    "answer": answer,
+                    "metrics": {
+                        "model": os.getenv("MODEL_NAME", "gemini-2.5-flash"),
+                        "time": f"{elapsed_time}s",
+                        "type": "Local Video",
+                    },
+                }
+            )
+        except Exception as e:
+            logger.exception("Video VQA controller error")
+            return jsonify({"error": str(e)}), 500
+        finally:
+            # Clean up local temp file
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                    logger.info(f"Removed temporary local video file: {temp_file_path}")
+                except Exception as rm_e:
+                    logger.warning(
+                        f"Failed to remove temp file {temp_file_path}: {rm_e}"
+                    )
+
+    # 3. Case C: Image file is uploaded
+    if "image" in request.files and request.files["image"].filename != "":
+        image_file = request.files["image"]
+        try:
+            img_b64 = validate_and_process_image(image_file)
+            answer = get_engine().predict(img_b64, question)
+            elapsed_time = round(time.time() - start_time, 2)
+            return jsonify(
+                {
+                    "answer": answer,
+                    "metrics": {
+                        "model": os.getenv("MODEL_NAME", "gemini-2.5-flash"),
+                        "time": f"{elapsed_time}s",
+                        "type": "Image",
+                    },
+                }
+            )
+        except ValueError as val_err:
+            return jsonify({"error": str(val_err)}), 400
+        except UnidentifiedImageError:
+            return jsonify({"error": "Invalid or corrupted image"}), 400
+        except Image.DecompressionBombError:
+            return jsonify({"error": "Image file too large (decompression bomb)"}), 413
+        except Exception:
+            logger.exception("Image VQA controller error")
+            return jsonify({"error": "Internal server error processing image"}), 500
+
+    # No media input provided
+    return jsonify(
+        {"error": "Please upload an image, a video, or provide a YouTube URL."}
+    ), 400
+
 
 if __name__ == "__main__":
-    import uvicorn
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "5000"))
-    uvicorn.run(app, host=host, port=port)
+    debug = os.getenv("FLASK_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+    app.run(host=host, port=port, debug=debug)
