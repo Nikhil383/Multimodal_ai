@@ -1,0 +1,1 @@
+{"type":"config","name":"Optimize test runtime and monitor correctness","metricName":"test_runtime","metricUnit":"s","bestDirection":"lower"}

@@ -15,6 +15,7 @@ __pycache__/
 venv/
 .env/
 .env.*
+.env.example
 
 # uv files
 .uv/
@@ -35,6 +36,11 @@ Thumbs.db
 build/
 dist/
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 
 # Logs
 *.log
@@ -54,3 +60,6 @@ assets/sample_inputs/*
 
 # If you don’t want to ignore assets, comment these lines
 # assets/*
+CLAUDE.md
+interview.md
+ppt.md
