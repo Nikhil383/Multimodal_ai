@@ -21,6 +21,7 @@ def test_predict_success(mock_llm_cls):
     # Initialize engine
     # We ignore API key warning in tests since we mock LLM
     with patch.dict("os.environ", {"GOOGLE_API_KEY": "fake_key"}):
+        # Use default GeminiProvider via VQAEngine
         engine = VQAEngine()
 
     # Create fake image and convert to base64
